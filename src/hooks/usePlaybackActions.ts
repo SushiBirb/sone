@@ -882,9 +882,11 @@ export function usePlaybackActions() {
     [store],
   );
 
-  const playNext = useCallback(
+    const playNext = useCallback(
     async (options?: { explicit?: boolean }) => {
-      if (playNextLockRef.current) return;
+      if (playNextLockRef.current) {
+        return;
+      }
       playNextLockRef.current = true;
       store.set(userPausedAtom, false);
       try {
