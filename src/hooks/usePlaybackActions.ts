@@ -179,6 +179,34 @@ const DEVICE_RETRY_DELAY = 500;
 const DEVICE_MAX_RETRIES = 10;
 const MAX_HISTORY_TRACKS = 500;
 const PLAY_REENTRY_GUARD_MS = 250;
+/** Hard ceiling on one play_tidal_track attempt. A backend that never
+ *  answers must not hold `markPlaybackLoading(true)` forever — that gate
+ *  freezes the progress bar and the transport glyphs (2026-10-17 incident):
+ *  timing out turns the hang into a rollback + toast so the user regains
+ *  the controls and can simply retry. */
+const PLAY_ATTEMPT_TIMEOUT_MS = 20_000;
+/** Same ceiling for resume/transport invokes that gate UI state. */
+const TRANSPORT_TIMEOUT_MS = 10_000;
+
+async function withInvokeTimeout<T>(args: { cmd: string; payload: Record<string, unknown>; timeoutMs: number }): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `backend did not answer '${args.cmd}' within ${args.timeoutMs / 1000}s`,
+          ),
+        ),
+      args.timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([invoke<T>(args.cmd, args.payload), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 /** Invoke play_tidal_track with automatic device-busy retry.
  *  When PipeWire holds the ALSA device after pipeline teardown, this retries
@@ -190,9 +218,10 @@ async function invokePlayWithRetry(
 ): Promise<StreamInfo> {
   for (let attempt = 0; attempt <= DEVICE_MAX_RETRIES; attempt++) {
     try {
-      return await invoke<StreamInfo>("play_tidal_track", {
-        trackId,
-        useTrackGain,
+      return await withInvokeTimeout<StreamInfo>({
+        cmd: "play_tidal_track",
+        payload: { trackId, useTrackGain },
+        timeoutMs: PLAY_ATTEMPT_TIMEOUT_MS,
       });
     } catch (err: unknown) {
       if (isDeviceBusy(err) && attempt < DEVICE_MAX_RETRIES) {
@@ -462,7 +491,11 @@ export function usePlaybackActions() {
       const track = store.get(currentTrackAtom);
       if (!track) return;
 
-      const isFinished = await invoke<boolean>("is_track_finished");
+      const isFinished = await withInvokeTimeout<boolean>({
+        cmd: "is_track_finished",
+        payload: {},
+        timeoutMs: TRANSPORT_TIMEOUT_MS,
+      });
       if (isFinished) {
         // Replaying a finished track from the top: gate interpolation so the bar
         // doesn't show the stale end position during the reload.
@@ -488,7 +521,11 @@ export function usePlaybackActions() {
           ),
         }).catch(() => {});
       } else {
-        await invoke("resume_track");
+        await withInvokeTimeout<void>({
+          cmd: "resume_track",
+          payload: {},
+          timeoutMs: TRANSPORT_TIMEOUT_MS,
+        });
       }
       store.set(isPlayingAtom, true);
     } catch (error) {
