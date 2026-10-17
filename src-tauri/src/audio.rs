@@ -3,10 +3,22 @@ use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use tauri::Emitter;
+
+/// Wall-clock ms of the most recent `PlayUrl` command; the ALSA writer
+/// compares its first successful write against this to report the
+/// command-to-audible-sample latency in the app log.
+static TRACK_T0_MS: AtomicI64 = AtomicI64::new(0);
+
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Read the real GStreamer registry.
 ///
@@ -1412,10 +1424,20 @@ fn spawn_alsa_writer(
                         resolve_pending(&mut pending_promotion_from, &current_fmt);
                         let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
                         apply_volume(&mut chunk.data, &current_fmt, vol);
+                        let frames_before = frames_written.load(Ordering::Relaxed);
                         if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
                             app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                             tearing_down.store(true, Ordering::SeqCst);
                             break;
+                        }
+                        if frames_before == 0 && frames_written.load(Ordering::Relaxed) > 0 {
+                            let t0 = TRACK_T0_MS.load(Ordering::Acquire);
+                            if t0 > 0 {
+                                log::info!(
+                                    "[latency] audio: first samples written {} ms after play start",
+                                    wall_ms().saturating_sub(t0)
+                                );
+                            }
                         }
                     }
 
@@ -1554,9 +1576,19 @@ fn spawn_alsa_writer(
                                     resolve_pending(&mut pending_promotion_from, &current_fmt);
                                     let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
                                     apply_volume(&mut chunk.data, &current_fmt, vol);
+                                    let frames_before = frames_written.load(Ordering::Relaxed);
                                     if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
                                         app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                                         break 'main;
+                                    }
+                                    if frames_before == 0 && frames_written.load(Ordering::Relaxed) > 0 {
+                                        let t0 = TRACK_T0_MS.load(Ordering::Acquire);
+                                        if t0 > 0 {
+                                            log::info!(
+                                                "[latency] audio: first samples written {} ms after play start",
+                                                wall_ms().saturating_sub(t0)
+                                            );
+                                        }
                                     }
                                     break; // back to main loop
                                 }
@@ -1936,6 +1968,8 @@ impl AudioPlayer {
                         start_secs,
                         reply,
                     } => {
+                        let t0 = std::time::Instant::now();
+                        TRACK_T0_MS.store(wall_ms(), Ordering::Release);
                         let result = (|| -> Result<(), String> {
                             // ── Teardown old backend (GStreamer pipeline only) ──
                             if let Some(old_backend) = backend.take() {
@@ -1999,6 +2033,10 @@ impl AudioPlayer {
                             current_branch = None;
 
                             tearing_down.store(false, Ordering::SeqCst);
+                            log::info!(
+                                "[latency] audio: teardown {} ms",
+                                t0.elapsed().as_millis()
+                            );
                             eos.store(false, Ordering::SeqCst);
                             has_uri.store(true, Ordering::SeqCst);
                             frames_written.store(0, Ordering::Relaxed);
@@ -2134,6 +2172,10 @@ impl AudioPlayer {
                                     // Start pipeline directly — errors come via bus watcher
                                     pipe.set_state(gst::State::Playing)
                                         .map_err(|e| format!("Failed to start playback: {e}"))?;
+                                    log::info!(
+                                        "[latency] audio: direct-alsa pipeline dispatched {} ms",
+                                        t0.elapsed().as_millis()
+                                    );
 
                                     // Bus watcher: decode errors + EOS → forward to writer
                                     let eos_flag = Arc::clone(&eos);
@@ -2228,11 +2270,18 @@ impl AudioPlayer {
                                     gst::ElementFactory::make("uridecodebin").property("uri", &uri);
                                 if is_dash {
                                     udb = udb
-                                        .property("buffer-duration", 15_000_000_000i64)
+                                        // Cold-start buffering target: 3 s of audio
+                                        // gates the source before the first sample,
+                                        // which on a slow network moment is 5x sooner
+                                        // than the 15 s the queue tops up to later.
+                                        // The gapless branch (attach_next_bin) keeps
+                                        // the 15 s target because it prerolls while
+                                        // the previous track still plays.
+                                        .property("buffer-duration", 3_000_000_000i64)
                                         .property("use-buffering", true);
                                 } else {
                                     udb = udb
-                                        .property("buffer-duration", 5_000_000_000i64)
+                                        .property("buffer-duration", 1_500_000_000i64)
                                         .property("use-buffering", true);
                                 }
                                 let uridecodebin = udb
@@ -2467,6 +2516,10 @@ impl AudioPlayer {
 
                                 pipe.set_state(gst::State::Playing)
                                     .map_err(|e| format!("Failed to start playback: {e}"))?;
+                                log::info!(
+                                    "[latency] audio: pipeline dispatched {} ms",
+                                    t0.elapsed().as_millis()
+                                );
 
                                 // Bus watcher (normal mode). 2b: the StreamStart arm
                                 // (2a gapless trigger) is gone; advance is driven by
@@ -3710,12 +3763,14 @@ fn build_appsink_pipeline(
     watch_pipeline_sources(&pipe, route);
     let mut udb = gst::ElementFactory::make("uridecodebin").property("uri", uri);
     if is_dash {
+        // Cold-start buffering target; see the Normal-path PlayUrl comment.
+        // The 15 s jitter cushion is the branch queue's job on both paths.
         udb = udb
-            .property("buffer-duration", 15_000_000_000i64)
+            .property("buffer-duration", 3_000_000_000i64)
             .property("use-buffering", true);
     } else {
         udb = udb
-            .property("buffer-duration", 5_000_000_000i64)
+            .property("buffer-duration", 1_500_000_000i64)
             .property("use-buffering", true);
     }
     let uridecodebin = udb
